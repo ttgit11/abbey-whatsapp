@@ -1,0 +1,15 @@
+# Requirements for the OFFSITE WhatsApp valuer service ONLY (Railway/Render).
+# This is deliberately minimal — the webhook needs none of the desk app's camera,
+# audio or Streamlit libraries. Railway installs exactly what's listed here.
+#
+# Railway auto-detects this file. If you keep the desk app's full requirements.txt
+# in the same repo, RENAME this one to requirements.txt for the deploy, OR point
+# Railway at it. (Simplest: the repo you push to Railway should have THIS as its
+# requirements.txt.)
+
+anthropic>=0.40.0          # Abbey's brain (vision + text)
+flask>=3.0.0               # the webhook server
+gunicorn>=21.2.0           # production web server Railway runs
+requests>=2.31.0           # Twilio REST calls + media download
+openpyxl>=3.1.0            # builds the Go Auction Excel sent back over WhatsApp
+pandas>=2.0.0              # storage.all_lots returns a DataFrame
