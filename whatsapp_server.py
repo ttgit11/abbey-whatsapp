@@ -29,7 +29,7 @@ from flask import Flask, request, Response
 
 import logging
 
-from abbey import offsite, agent, knowledge, storage, increments, memory
+from abbey import offsite, batch, agent, knowledge, storage, increments, memory
 import config
 import seed_house_knowledge
 
@@ -49,6 +49,8 @@ MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 # One session per sender number. (Simple in-memory store; fine for a few valuers.)
 _sessions: dict[str, offsite.Session] = {}
+_batch_sessions: dict[str, batch.BatchSession] = {}
+_mode: dict[str, str] = {}          # sender -> "valuer" | "batch"  (default valuer)
 _lock = threading.Lock()
 # Guard so a job isn't processed twice at once (webhook + watchdog race).
 _processing: set[str] = set()
@@ -73,6 +75,13 @@ def _session(sender: str) -> offsite.Session:
         if sender not in _sessions:
             _sessions[sender] = offsite.Session()
         return _sessions[sender]
+
+
+def _batch_session(sender: str) -> batch.BatchSession:
+    with _lock:
+        if sender not in _batch_sessions:
+            _batch_sessions[sender] = batch.BatchSession()
+        return _batch_sessions[sender]
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +233,121 @@ def build_excel(job) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Conversational photo-batch workers
+# ---------------------------------------------------------------------------
+def _analyse_lot(client, conn, sys_prompt, receipt, lot_number, lot) -> None:
+    """Catalogue one batch lot (uses its first photo). Raises on failure."""
+    idx = lot.photo_idx[0]
+    # lot.photo_idx are indices into batch.photos; the server passes the resolved path list
+    with open(lot._first_path, "rb") as fh:   # set by caller
+        img = fh.read()
+    note = (f"\nOperator note: {lot.note}" if lot.note else "")
+    if len(lot.photo_idx) > 1:
+        note += (f"\nThis lot groups {len(lot.photo_idx)} photos as ONE auction lot — "
+                 f"treat as a single item or a bundle/pack.")
+    draft = agent.analyze_item(
+        client, img, model=config.SETTINGS.model_primary,
+        max_tokens=config.SETTINGS.max_tokens, system_prompt=sys_prompt + note,
+        receipt=receipt, item_no=str(lot_number),
+        enable_web=config.SETTINGS.enable_web_research)
+    lot.title, lot.description, lot.category = draft.title, draft.description, draft.category
+    if draft.category and draft.ai_low_estimate and draft.ai_high_estimate:
+        lo, hi = knowledge.effective_estimate(
+            conn, draft.category, draft.ai_low_estimate, draft.ai_high_estimate)
+    else:
+        lo, hi = increments.snap_estimate(draft.low_estimate or 0, draft.high_estimate or 0)
+    lot.low, lot.high = float(lo), float(hi)
+    lot.dirty = False
+
+
+def _analyse_batch(sender: str) -> int:
+    """Analyse all dirty lots in the batch. Returns count failed."""
+    bs = _batch_session(sender)
+    bt = bs.batch
+    if bt is None:
+        return 0
+    from anthropic import Anthropic
+    conn = storage.connect(config.DB_PATH)
+    client = Anthropic(api_key=config.get_api_key())
+    sys_prompt = agent.build_system_prompt(
+        config.SETTINGS.house_name, knowledge.all_comps(conn),
+        knowledge.trusted_sources(conn), config.SETTINGS.buyers_premium_pct,
+        insights_block=memory.context_for(conn))
+    failed = 0
+    for i, lot in enumerate(bt.live_lots(), 1):
+        if not lot.dirty:
+            continue
+        lot._first_path = bt.photos[lot.photo_idx[0]].ref
+        try:
+            _analyse_lot(client, conn, sys_prompt, bt.receipt, i, lot)
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            log.warning("Batch lot %s failed: %s", i, e)
+            if not lot.title:
+                lot.title = f"(lot {i} — needs manual review)"
+            lot.dirty = False
+    return failed
+
+
+def batch_review_and_reply(sender: str, to: str) -> None:
+    """Analyse the batch (so titles are real), then send the proposal list."""
+    with _lock:
+        if sender in _processing:
+            return
+        _processing.add(sender)
+    try:
+        _analyse_batch(sender)
+        bs = _batch_session(sender)
+        for chunk in offsite.split_for_whatsapp(batch.format_proposal(bs.batch)):
+            send_whatsapp(to, chunk)
+    except Exception as e:  # noqa: BLE001
+        log.exception("batch_review failed")
+        send_whatsapp(to, f"Abbey had trouble reviewing that batch: {e}")
+    finally:
+        with _lock:
+            _processing.discard(sender)
+
+
+def batch_finalise_and_reply(sender: str, to: str) -> None:
+    """Final analysis pass, then send the list + Go Auction Excel."""
+    with _lock:
+        if sender in _processing:
+            return
+        _processing.add(sender)
+    try:
+        failed = _analyse_batch(sender)
+        bs = _batch_session(sender)
+        bt = bs.batch
+        for chunk in offsite.split_for_whatsapp(batch.format_final(bt)):
+            send_whatsapp(to, chunk)
+        # build the Excel from the batch lots
+        from openpyxl import Workbook
+        wb = Workbook(); ws = wb.active
+        ws.append(config.SETTINGS.csv_columns)
+        for n, lot in enumerate(bt.live_lots(), 1):
+            ws.append([n, lot.title, lot.description or "",
+                       int(lot.low) if lot.low else "", int(lot.high) if lot.high else "",
+                       lot.category, "", config.SETTINGS.default_consign_to, "", "", "", ""])
+        out = MEDIA_DIR / f"receipt_{bt.receipt or 'batch'}_{int(time.time())}.xlsx"
+        wb.save(out)
+        public = os.environ.get("PUBLIC_BASE_URL", "")
+        if public:
+            send_media(to, f"{public}/files/{out.name}",
+                       caption=f"Go Auction upload — receipt {bt.receipt}")
+        if failed:
+            send_whatsapp(to, f"Note: {failed} lot(s) need manual review.")
+        _mode[sender] = "valuer"    # reset mode after finalising
+    except Exception as e:  # noqa: BLE001
+        log.exception("batch_finalise failed")
+        if bs.batch:
+            bs.batch.finalised = False
+        send_whatsapp(to, f"Abbey hit a problem finalising: {e}. Send 'done' to retry.")
+    finally:
+        with _lock:
+            _processing.discard(sender)
+
+
+# ---------------------------------------------------------------------------
 # Idle-finalise watchdog (2 minutes of silence = done)
 # ---------------------------------------------------------------------------
 def _watchdog() -> None:
@@ -247,10 +371,15 @@ def whatsapp():
     sender = request.form.get("From", "")
     body = request.form.get("Body", "")
     num_media = int(request.form.get("NumMedia", 0) or 0)
-    sess = _session(sender)
     to = DEFAULT_TO or sender
+    mode = _mode.get(sender, "valuer")
 
-    # photos first
+    # A receipt number resets BOTH sessions and returns to the default (valuer) mode
+    # unless/until the operator says "review" to enter batch mode.
+    rcpt = offsite.looks_like_receipt(body.strip()) if body.strip() else None
+
+    # download any photos once; feed to whichever mode is active
+    photo_paths = []
     for i in range(num_media):
         url = request.form.get(f"MediaUrl{i}")
         if not url:
@@ -258,9 +387,44 @@ def whatsapp():
         dest = MEDIA_DIR / f"{sender.replace(':','_').replace('+','')}_{int(time.time()*1000)}_{i}.jpg"
         path = download_media(url, dest)
         if path:
-            sess.on_photo(path)
+            photo_paths.append(path)
 
-    # then the text (may be empty if only media)
+    # "review" (or "list"/"catalogue them") switches this job into conversational batch mode
+    if body.strip() and batch.wants_review(body) and mode != "batch":
+        _mode[sender] = "batch"; mode = "batch"
+        # carry any photos already sent in valuer mode into the batch session
+        bs = _batch_session(sender)
+        vs = _session(sender)
+        if vs.job and not bs.batch:
+            bs.batch = batch.Batch(receipt=vs.job.receipt)
+            for it in vs.job.items:
+                for p in it.photos:
+                    bs.batch.add_photo(p)
+
+    if mode == "batch":
+        bs = _batch_session(sender)
+        for p in photo_paths:
+            bs.on_photo(p)
+        if body.strip():
+            action = bs.on_text(body)
+            act = action["action"]
+            if act == "receipt":
+                _mode[sender] = "valuer"   # a new receipt starts fresh in valuer mode
+                send_whatsapp(to, f"Got receipt {action['receipt']}. Send photos, then either a "
+                                  f"note per item, or say 'review' to catalogue a whole batch together.")
+            elif act == "review":
+                threading.Thread(target=batch_review_and_reply, args=(sender, to), daemon=True).start()
+            elif act == "refine":
+                send_whatsapp(to, action["message"])
+                threading.Thread(target=batch_review_and_reply, args=(sender, to), daemon=True).start()
+            elif act == "done":
+                threading.Thread(target=batch_finalise_and_reply, args=(sender, to), daemon=True).start()
+        return Response("<Response></Response>", mimetype="application/xml")
+
+    # ----- default valuer mode (unchanged) -----
+    sess = _session(sender)
+    for p in photo_paths:
+        sess.on_photo(p)
     if body.strip():
         action = sess.on_text(body)
         if action["action"] in ("done", "edit"):
@@ -269,9 +433,10 @@ def whatsapp():
             send_whatsapp(to, f"There's no item {action['requested']} on this receipt "
                               f"(items are {action['existing']}). Try again with a valid number.")
         elif action["action"] == "receipt":
+            _mode[sender] = "valuer"
             send_whatsapp(to, f"Got receipt {action['receipt']}. Send photos, then a note per "
-                              f"item. Say 'done' when finished.")
-
+                              f"item — or say 'review' to catalogue a batch of photos together. "
+                              f"Say 'done' when finished.")
     return Response("<Response></Response>", mimetype="application/xml")
 
 
